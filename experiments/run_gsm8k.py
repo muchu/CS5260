@@ -85,8 +85,16 @@ async def main():
     result_dir.mkdir(parents=True, exist_ok=True)
     result_file = result_dir / f"{args.domain}_{args.llm_name}_{current_time}.json"
     
-    agent_names = [name for name,num in zip(args.agent_names,args.agent_nums) for _ in range(num)]
+    '''
+    +------------------------------+
+    | 1. Initialize the graph      |
+    +------------------------------+
+    '''
+    # 注册agent: math solver, inspector, programming expert, mathematical analyst
+    agent_names = [name for name,num in zip(args.agent_names,args.agent_nums) for _ in range(num)] 
+    # 决策方法: final refer
     decision_method = args.decision_method
+    # 创建连接图结构: 为4个agent创建结构模式不同的连接图（参见 p18 的 F existing spatial... Chain/tree/layered)
     kwargs = get_kwargs(args.mode,len(agent_names))
     graph = Graph(domain="gsm8k",
                   llm_name=args.llm_name,
@@ -95,8 +103,9 @@ async def main():
                   optimized_spatial=args.optimized_spatial,
                   optimized_temporal=args.optimized_temporal,
                   **kwargs)
+    # 标配 adam optimizer
     optimizer = torch.optim.Adam([graph.spatial_logits,graph.temporal_logits], lr=args.lr)    
-    
+    # 确定batch size，计算有效解决与否与执行数
     num_batches = int(len(dataset)/args.batch_size)
     total_solved, total_executed = (0, 0)
     
@@ -107,24 +116,57 @@ async def main():
         answers = []
         add_losses = []
         
+        # 实时获取当前batch
         current_batch = dataloader(dataset,args.batch_size,i_batch)
         if current_batch is None:
             print("No more data available.")
             break
         
+        '''
+        +-------------------------------------+
+        | 2. 算法核心部分: Argorithm 3         |
+        +-------------------------------------+
+        '''
         for i_record, record in enumerate(current_batch):
             realized_graph = copy.deepcopy(graph)
+            
+            '''
+            spatial_logits 和 temporal_logits 来自graph.py中的定义, initial均为logit转换 log(p/(1-p))
+            每一轮prune后, spatial_logits 根据 potential edges number 的all-ones tensor * log(p/(1-p)) update
+            并reshape到各个agent的连接图上. 
+            Temporal同理.
+            '''
             realized_graph.spatial_logits = graph.spatial_logits
             realized_graph.temporal_logits = graph.temporal_logits
-            
             spatial_matrix_train = realized_graph.spatial_logits.reshape((len(agent_names),len(agent_names)))
             temporal_matrix_train = realized_graph.temporal_logits.reshape((len(agent_names),len(agent_names)))
+            '''
+            mask 即论文中固定的优化掩码 S^t, S^s.根据agent数量生成固定matrix
+            '''
             spatial_matrix_fixed = torch.tensor(kwargs["fixed_spatial_masks"],dtype=torch.float32).reshape((len(agent_names),len(agent_names)))
             temporal_matrix_fixed = torch.tensor(kwargs["fixed_temporal_masks"],dtype=torch.float32).reshape((len(agent_names),len(agent_names)))
+            
+            '''
+            +-------------------------------------+
+            | 计算spatial_matrix_train和temporal_matrix_train的 nuclear norm -- for SVD
+            +-------------------------------------+
+            '''
             loss_s = nuclear_norm(spatial_matrix_train)
             loss_t = nuclear_norm(temporal_matrix_train)
+            
+            '''
+            +-------------------------------------+
+            | 计算spatial_matrix_fixed和temporal_matrix_fixed的L2 norm 
+            +-------------------------------------+
+            '''
             frob_loss_s = frobenius_norm(spatial_matrix_fixed, spatial_matrix_train)
             frob_loss_t = frobenius_norm(temporal_matrix_fixed, temporal_matrix_train)
+            
+            '''
+            +-------------------------------------+
+            | 核心公式之, 计算loss ||s||_* + ||t||_* + max(0, ||s||_F - delta) + max(0, ||t||_F - delta)
+            +-------------------------------------+
+            '''
             add_loss = loss_s + loss_t + F.relu(frob_loss_s - args.delta) + F.relu(frob_loss_t - args.delta)
             
             task = record["task"]
@@ -132,15 +174,24 @@ async def main():
             answer = record["answer"]
             answers.append(answer)
             input_dict = {"task": task}
+            '''
+            调用llm
+            '''
             answer_log_probs.append(asyncio.create_task(realized_graph.arun(input_dict,args.num_rounds)))
             add_losses.append(add_loss)
             
+        '''
+        +-------------------------------------+
+        | 3. asyncio agent execution |
+        +-------------------------------------+
+        '''
         raw_results = await asyncio.gather(*answer_log_probs)
         raw_answers, log_probs = zip(*raw_results)
         loss_list: List[torch.Tensor] = []
         utilities: List[float] = []
         data = load_result(result_file)
         
+        # 记录结果
         for task, answer, log_prob, add_loss, true_answer in zip(current_batch, raw_answers, log_probs, add_losses, answers):
             predict_answer = gsm_get_predict(answer[0])
             is_solved = float(predict_answer)==float(true_answer)
@@ -167,6 +218,11 @@ async def main():
         with open(result_file, 'w',encoding='utf-8') as file:
             json.dump(data, file, indent=4)
         
+        '''
+        +-------------------------------------+
+        | 4. 确定是否是optimalize, 是    |
+        +-------------------------------------+
+        '''
         total_loss = torch.mean(torch.stack(loss_list))
         if args.optimized_spatial or args.optimized_temporal:
             optimizer.zero_grad()
@@ -188,18 +244,34 @@ async def main():
         print("Spatial masks:", graph.spatial_masks)
         print("Temporal logits:", graph.temporal_masks)
         
+        '''
+        +-------------------------------------+
+        | 5. 优化终止; 选取k-best graph |
+        +-------------------------------------+
+        '''
         if (i_batch+1)%args.imp_per_iterations == 0 and i_batch < args.num_iterations and (args.optimized_spatial or args.optimized_temporal):
-            spatial_masks, temporal_masks = graph.update_masks(args.pruning_rate)
+            '''
+            根据pruning_rate一次性prune
+            '''
+            spatial_masks, temporal_masks = graph.update_masks(args.pruning_rate) 
             print("spatial masks:",spatial_masks)
             print("temporal masks:",temporal_masks)
             print("spatial sparsity:",spatial_masks.sum()/spatial_masks.numel())
             print("temporal sparsity:",temporal_masks.sum()/temporal_masks.numel())
+        # 总batch消耗完，停止优化
         if i_batch+1 == args.num_iterations:
             args.optimized_spatial = False
             args.optimized_temporal = False
         print(f"Cost {Cost.instance().value}")
         print(f"PromptTokens {PromptTokens.instance().value}")
         print(f"CompletionTokens {CompletionTokens.instance().value}")
+
+
+'''
++-------------------------------------+
+| 6. utilits: 根据不同mode生成不同graph结构 |
++-------------------------------------+
+'''
 
 
 def get_kwargs(mode:Union[Literal['DirectAnswer'],Literal['FullConnected'],Literal['Random'],Literal['Chain'],Literal['Debate'],Literal['Layered'],Literal['Star']]

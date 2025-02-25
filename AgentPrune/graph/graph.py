@@ -264,6 +264,10 @@ class Graph(ABC):
         for round in range(num_rounds):
             log_probs += self.construct_spatial_connection()
             log_probs += self.construct_temporal_connection(round)
+
+            '''
+            检查DAG部分
+            '''
             
             in_degree = {node_id: len(node.spatial_predecessors) for node_id, node in self.nodes.items()}
             zero_in_degree_queue = [node_id for node_id, deg in in_degree.items() if deg == 0]
@@ -308,14 +312,22 @@ class Graph(ABC):
 
     def update_masks(self, pruning_rate: float) -> torch.Tensor:
         if self.optimized_spatial:
+            # 统计现状
             num_edges = (self.spatial_masks > 0).sum()
+            # 现已裁边
             num_masks = (self.spatial_masks == 0).sum()
+            # 被裁边 (确定裁剪至少一条边 or 根据裁剪率决定)
             prune_num_edges = torch.round(num_edges*pruning_rate) if torch.round(num_edges*pruning_rate)>0 else 1
+            # 复制logits
             _edge_logits = self.spatial_logits.clone()
             min_edge_logit = _edge_logits.min()
+            # 已裁剪的赋予一个负值
             _edge_logits[self.spatial_masks == 0] = min_edge_logit - 1.0
+            # 按照logits递增
             sorted_edges_idx = torch.argsort(_edge_logits)
+            # 选取被裁边
             prune_idx = sorted_edges_idx[:int(prune_num_edges + num_masks)]
+            # 更新已裁边的masks
             self.spatial_masks[prune_idx] = 0
         
         if self.optimized_temporal:
